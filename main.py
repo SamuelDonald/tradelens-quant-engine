@@ -1,4 +1,5 @@
-
+import os
+from fastapi import Depends, Header
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional, Dict
@@ -7,6 +8,13 @@ import numpy as np
 import ta
 
 app = FastAPI(title="TradeLens Quant Engine", version="1.0.0")
+QUANT_ENGINE_API_KEY = os.getenv("QUANT_ENGINE_API_KEY")
+
+def verify_api_key(x_api_key: str = Header(...)):
+    if QUANT_ENGINE_API_KEY is None:
+        raise HTTPException(status_code=500, detail="API key not configured")
+    if x_api_key != QUANT_ENGINE_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 # -------------------------
 # Input Models
@@ -91,7 +99,7 @@ def walk_forward_confirm(df: pd.DataFrame):
 def health():
     return {"status": "ok"}
 
-@app.post("/quant/analyze")
+@app.post("/quant/analyze", dependencies=[Depends(verify_api_key)])
 def quant_engine_analysis(req: QuantRequest):
     df = pd.DataFrame([c.dict() for c in req.candles])
 
