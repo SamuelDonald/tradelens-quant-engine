@@ -1,18 +1,23 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, Depends, HTTPException
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
-from typing import List, Optional, Dict
+from typing import List, Optional
 import pandas as pd
 import numpy as np
-from ta.trend import EMAIndicator, MACD
-from ta.momentum import RSIIndicator
-from ta.volatility import AverageTrueRange
 import os
 
-app = FastAPI(title="TradeLens Quant Engine v2")
+app = FastAPI()
 
-# =========================
-# -------- MODELS ---------
-# =========================
+API_KEY_NAME = "X-API-KEY"
+api_key_header = APIKeyHeader(name=API_KEY_NAME)
+
+ENGINE_API_KEY = os.getenv("ENGINE_API_KEY")
+
+def verify_key(key: str = Depends(api_key_header)):
+    if key != ENGINE_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+# -------- Data Models --------
 
 class Candle(BaseModel):
     open: float
@@ -26,174 +31,119 @@ class QuantRequest(BaseModel):
     timeframe: str
     candles: List[Candle]
 
-# =========================
-# -------- HELPERS --------
-# =========================
+# -------- Helper Functions --------
 
-def neutral_response(req, reason, indicators, debug):
-    return {
-        "symbol": req.symbol,
-        "timeframe": req.timeframe,
-        "state": "NO_TRADE",
-        "confidence_probability": 0.0,
-        "confidence_score": 0,
-        "entry_price": None,
-        "take_profit": None,
-        "stop_loss": None,
-        "conditions": {},
-        "indicators": indicators,
-        "debug": {**debug, "reason": reason}
-    }
+def detect_swings(df, lookback=2):
+    highs = df["high"]
+    lows = df["low"]
 
-# =========================
-# -------- ENGINE ---------
-# =========================
+    swing_highs = (highs.shift(lookback) < highs) & (highs.shift(-lookback) < highs)
+    swing_lows = (lows.shift(lookback) > lows) & (lows.shift(-lookback) > lows)
 
-@app.post("/quant/analyze")
-def quant_engine_analysis(req: QuantRequest):
+    return swing_highs, swing_lows
 
-    if len(req.candles) < 20:
-        raise HTTPException(status_code=400, detail="Insufficient candles")
+def classify_structure(df):
+    swing_highs, swing_lows = detect_swings(df)
 
-    # ---- DataFrame ----
+    recent_highs = df.loc[swing_highs, "high"].tail(3)
+    recent_lows = df.loc[swing_lows, "low"].tail(3)
+
+    if len(recent_highs) < 2 or len(recent_lows) < 2:
+        return None
+
+    hh = recent_highs.iloc[-1] > recent_highs.iloc[-2]
+    hl = recent_lows.iloc[-1] > recent_lows.iloc[-2]
+    lh = recent_highs.iloc[-1] < recent_highs.iloc[-2]
+    ll = recent_lows.iloc[-1] < recent_lows.iloc[-2]
+
+    if hh and hl:
+        return "BULLISH"
+    if lh and ll:
+        return "BEARISH"
+
+    return "RANGING"
+
+def detect_liquidity_sweep(df):
+    last = df.iloc[-1]
+    prev_high = df["high"].iloc[-6:-1].max()
+    prev_low = df["low"].iloc[-6:-1].min()
+
+    if last.high > prev_high and last.close < prev_high:
+        return "HIGH_SWEEP"
+    if last.low < prev_low and last.close > prev_low:
+        return "LOW_SWEEP"
+
+    return None
+
+def atr(df, period=14):
+    tr = np.maximum(
+        df["high"] - df["low"],
+        np.maximum(
+            abs(df["high"] - df["close"].shift()),
+            abs(df["low"] - df["close"].shift())
+        )
+    )
+    return tr.rolling(period).mean().iloc[-1]
+
+# -------- Main Engine --------
+
+@app.post("/quant/smc", dependencies=[Depends(verify_key)])
+def smc_engine(req: QuantRequest):
+    if len(req.candles) < 30:
+        return {"state": "NO_TRADE", "reason": "INSUFFICIENT_DATA"}
+
     df = pd.DataFrame([c.dict() for c in req.candles])
-    df = df.rename(columns={
-        "open": "o", "high": "h", "low": "l", "close": "c", "volume": "v"
-    })
-    df = df.sort_index()
 
-    # ---- Adaptive Lookback ----
-    lookback = min(50, len(df) // 2)
-    if lookback < 14:
-        raise HTTPException(status_code=400, detail="Insufficient lookback")
+    structure = classify_structure(df)
+    liquidity = detect_liquidity_sweep(df)
+    current_atr = atr(df)
 
-    # ---- Indicators ----
-    df["EMA20"] = EMAIndicator(df["c"], 20).ema_indicator()
-    df["EMA50"] = EMAIndicator(df["c"], 50).ema_indicator()
-
-    rsi = RSIIndicator(df["c"], 14).rsi()
-    df["RSI"] = rsi
-
-    macd = MACD(df["c"])
-    df["MACD"] = macd.macd()
-    df["MACD_SIGNAL"] = macd.macd_signal()
-
-    atr = AverageTrueRange(df["h"], df["l"], df["c"], 14).average_true_range()
-    df["ATR"] = atr
-
-    latest = df.iloc[-1]
+    last = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # ---- Indicator Validity ----
-    if latest.isna().any():
-        return neutral_response(
-            req,
-            "INDICATOR_NAN",
-            indicators={},
-            debug={"lookback": lookback}
-        )
-
-    # ---- Regime ----
-    atr_ratio = latest.ATR / latest.c if latest.c != 0 else 0
-    ema_slope = df["EMA50"].iloc[-1] - df["EMA50"].iloc[-5]
-
-    if atr_ratio < 0.001:
-        regime = "LOW_VOL"
-    elif ema_slope > 0:
-        regime = "TRENDING_UP"
-    elif ema_slope < 0:
-        regime = "TRENDING_DOWN"
-    else:
-        regime = "RANGING"
-
-    # ---- Conditions ----
-    conditions = {
-        "ema_bull": latest.EMA20 > latest.EMA50,
-        "ema_bear": latest.EMA20 < latest.EMA50,
-        "rsi_pullback_long": 40 < latest.RSI < 65,
-        "rsi_pullback_short": 35 < latest.RSI < 60,
-        "macd_bull_cross": prev.MACD <= prev.MACD_SIGNAL and latest.MACD > latest.MACD_SIGNAL,
-        "macd_bear_cross": prev.MACD >= prev.MACD_SIGNAL and latest.MACD < latest.MACD_SIGNAL,
-        "volatility_ok": atr_ratio >= 0.001
-    }
-
-    indicators = {
-        "EMA20": float(latest.EMA20),
-        "EMA50": float(latest.EMA50),
-        "RSI": float(latest.RSI),
-        "MACD": float(latest.MACD),
-        "MACD_SIGNAL": float(latest.MACD_SIGNAL),
-        "ATR": float(latest.ATR),
-        "ATR_ratio": float(atr_ratio),
-        "regime": regime
-    }
-
-    debug = {
-        "atr_ratio": atr_ratio,
-        "ema_slope": ema_slope,
-        "lookback": lookback
-    }
-
-    # =========================
-    # ---- STATE MACHINE -----
-    # =========================
-
+    # Default response
     state = "NO_TRADE"
+    direction = None
+    confidence = 0.0
 
-    # ---- LONG SETUP ----
-    if (
-        regime == "TRENDING_UP"
-        and conditions["ema_bull"]
-        and conditions["rsi_pullback_long"]
-        and conditions["volatility_ok"]
-    ):
+    # -------- SETUP LOGIC --------
+    if structure == "BULLISH":
         state = "SETUP_LONG"
+        direction = "LONG"
+        confidence += 0.6
+        if liquidity == "LOW_SWEEP":
+            confidence += 0.15
 
-    # ---- SHORT SETUP ----
-    if (
-        regime == "TRENDING_DOWN"
-        and conditions["ema_bear"]
-        and conditions["rsi_pullback_short"]
-        and conditions["volatility_ok"]
-    ):
+    elif structure == "BEARISH":
         state = "SETUP_SHORT"
+        direction = "SHORT"
+        confidence += 0.6
+        if liquidity == "HIGH_SWEEP":
+            confidence += 0.15
 
-    # ---- EXECUTION TRIGGERS ----
-    if state == "SETUP_LONG" and conditions["macd_bull_cross"]:
-        state = "EXECUTE_LONG"
+    # -------- EXECUTION LOGIC --------
+    displacement = abs(last.close - last.open) > current_atr
 
-    if state == "SETUP_SHORT" and conditions["macd_bear_cross"]:
-        state = "EXECUTE_SHORT"
+    if state == "SETUP_LONG":
+        bos = last.close > df["high"].iloc[-5:-1].max()
+        if bos and displacement:
+            state = "EXECUTE_LONG"
+            confidence += 0.25
 
-    # ---- Risk Model ----
-    entry = float(latest.c)
-    atr_val = float(latest.ATR)
-
-    if state == "EXECUTE_LONG":
-        stop = entry - atr_val
-        target = entry + (2 * atr_val)
-        confidence = 0.82
-    elif state == "EXECUTE_SHORT":
-        stop = entry + atr_val
-        target = entry - (2 * atr_val)
-        confidence = 0.82
-    elif state.startswith("SETUP"):
-        stop = None
-        target = None
-        confidence = 0.62
-    else:
-        return neutral_response(req, "NO_VALID_SETUP", indicators, debug)
+    if state == "SETUP_SHORT":
+        bos = last.close < df["low"].iloc[-5:-1].min()
+        if bos and displacement:
+            state = "EXECUTE_SHORT"
+            confidence += 0.25
 
     return {
         "symbol": req.symbol,
         "timeframe": req.timeframe,
         "state": state,
-        "confidence_probability": confidence,
-        "confidence_score": round(confidence * 100),
-        "entry_price": entry,
-        "take_profit": target,
-        "stop_loss": stop,
-        "conditions": conditions,
-        "indicators": indicators,
-        "debug": debug
+        "direction": direction,
+        "confidence": round(min(confidence, 1.0), 2),
+        "structure": structure,
+        "liquidity_event": liquidity,
+        "execution_validity": "next_candle",
+        "engine_type": "SMC_STATE_ENGINE"
     }
