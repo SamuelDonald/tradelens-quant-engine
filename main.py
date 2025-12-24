@@ -35,21 +35,14 @@ class QuantRequest(BaseModel):
     candles: List[Candle]
 
 # =======================
-# UTILITY FUNCTIONS
+# UTILS
 # =======================
-def aggregate_to_4h(df: pd.DataFrame, factor: int = 4) -> Optional[pd.DataFrame]:
-    """
-    Aggregate 1H candles into 4H candles.
-    """
-    if len(df) < factor * 10:
-        return None
-
+def aggregate_to_4h(df: pd.DataFrame, factor: int = 4):
     rows = []
     for i in range(0, len(df), factor):
         chunk = df.iloc[i:i + factor]
         if len(chunk) < factor:
             continue
-
         rows.append({
             "open": chunk.iloc[0]["open"],
             "high": chunk["high"].max(),
@@ -57,168 +50,136 @@ def aggregate_to_4h(df: pd.DataFrame, factor: int = 4) -> Optional[pd.DataFrame]
             "close": chunk.iloc[-1]["close"],
             "volume": chunk["volume"].sum()
         })
-
     return pd.DataFrame(rows)
 
-def detect_swings(df: pd.DataFrame, lookback: int = 2):
-    highs = df["high"]
-    lows = df["low"]
+def swings(df, lb=2):
+    sh = (df.high.shift(lb) < df.high) & (df.high.shift(-lb) < df.high)
+    sl = (df.low.shift(lb) > df.low) & (df.low.shift(-lb) > df.low)
+    return sh, sl
 
-    swing_highs = (highs.shift(lookback) < highs) & (highs.shift(-lookback) < highs)
-    swing_lows = (lows.shift(lookback) > lows) & (lows.shift(-lookback) > lows)
+def structure_state(df):
+    sh, sl = swings(df)
+    highs = df.loc[sh, "high"].tail(3)
+    lows = df.loc[sl, "low"].tail(3)
 
-    return swing_highs, swing_lows
+    if len(highs) < 2 or len(lows) < 2:
+        return "UNDEFINED"
 
-def classify_structure(df: pd.DataFrame) -> Optional[str]:
-    swing_highs, swing_lows = detect_swings(df)
+    if highs.iloc[-1] > highs.iloc[-2] and lows.iloc[-1] > lows.iloc[-2]:
+        return "HH-HL"
 
-    recent_highs = df.loc[swing_highs, "high"].tail(3)
-    recent_lows = df.loc[swing_lows, "low"].tail(3)
+    if highs.iloc[-1] < highs.iloc[-2] and lows.iloc[-1] < lows.iloc[-2]:
+        return "LH-LL"
 
-    if len(recent_highs) < 2 or len(recent_lows) < 2:
-        return None
+    return "BROKEN"
 
-    if recent_highs.iloc[-1] > recent_highs.iloc[-2] and recent_lows.iloc[-1] > recent_lows.iloc[-2]:
-        return "BULLISH"
-
-    if recent_highs.iloc[-1] < recent_highs.iloc[-2] and recent_lows.iloc[-1] < recent_lows.iloc[-2]:
-        return "BEARISH"
-
-    return "RANGING"
-
-def detect_liquidity_sweep(df: pd.DataFrame) -> Optional[str]:
-    if len(df) < 6:
-        return None
-
+def liquidity_event(df):
     last = df.iloc[-1]
-    prev_high = df["high"].iloc[-6:-1].max()
-    prev_low = df["low"].iloc[-6:-1].min()
+    prev_high = df.high.iloc[-10:-1].max()
+    prev_low = df.low.iloc[-10:-1].min()
 
     if last.high > prev_high and last.close < prev_high:
-        return "HIGH_SWEEP"
+        return "BUY_SIDE_TAKEN"
 
     if last.low < prev_low and last.close > prev_low:
-        return "LOW_SWEEP"
+        return "SELL_SIDE_TAKEN"
 
-    return None
-
-def atr(df: pd.DataFrame, period: int = 14) -> Optional[float]:
-    if len(df) < period + 1:
-        return None
-
-    tr = np.maximum(
-        df["high"] - df["low"],
-        np.maximum(
-            abs(df["high"] - df["close"].shift()),
-            abs(df["low"] - df["close"].shift())
-        )
-    )
-    value = tr.rolling(period).mean().iloc[-1]
-    if pd.isna(value):
-        return None
-    return value
+    return "NONE"
 
 # =======================
-# MAIN SMC ENGINE
+# MAIN ENGINE
 # =======================
 @app.post("/quant/smc", dependencies=[Depends(verify_key)])
 def smc_engine(req: QuantRequest):
 
-    # ---- HARD DATA GUARD ----
-    if len(req.candles) < 50:
-        return {
-            "symbol": req.symbol,
-            "timeframe": req.timeframe,
-            "state": "NO_TRADE",
-            "direction": None,
-            "confidence": 0.0,
-            "structure": None,
-            "liquidity_event": None,
-            "htf_bias": None,
-            "execution_validity": None,
-            "engine_type": "SMC_STATE_ENGINE",
-            "reason": "INSUFFICIENT_DATA"
-        }
+    if len(req.candles) < 60:
+        raise HTTPException(400, "Insufficient candle data")
 
-    df_1h = pd.DataFrame([c.dict() for c in req.candles])
+    df = pd.DataFrame([c.dict() for c in req.candles])
+    df_4h = aggregate_to_4h(df)
 
-    # ---- DERIVE HTF (4H) INTERNALLY ----
-    df_4h = aggregate_to_4h(df_1h)
-    htf_bias = classify_structure(df_4h) if df_4h is not None else None
+    ltf_structure = structure_state(df)
+    htf_structure = structure_state(df_4h) if len(df_4h) >= 10 else "UNDEFINED"
+    liquidity = liquidity_event(df)
 
-    # ---- LTF ANALYSIS (1H) ----
-    structure = classify_structure(df_1h)
-    liquidity = detect_liquidity_sweep(df_1h)
-    current_atr = atr(df_1h)
+    high = df.high.max()
+    low = df.low.min()
+    mid = (high + low) / 2
+    last_price = df.close.iloc[-1]
 
-    if current_atr is None:
-        return {
-            "symbol": req.symbol,
-            "timeframe": req.timeframe,
-            "state": "NO_TRADE",
-            "direction": None,
-            "confidence": 0.0,
-            "structure": structure,
-            "liquidity_event": liquidity,
-            "htf_bias": htf_bias,
-            "execution_validity": None,
-            "engine_type": "SMC_STATE_ENGINE",
-            "reason": "ATR_UNAVAILABLE"
-        }
+    price_location = (
+        "DISCOUNT" if last_price < mid else
+        "PREMIUM" if last_price > mid else
+        "EQUILIBRIUM"
+    )
 
-    last = df_1h.iloc[-1]
+    bias = "NEUTRAL"
+    bias_conf = 0.5
+    bias_reason = []
 
-    state = "NO_TRADE"
-    direction = None
-    confidence = 0.0
+    if htf_structure == "HH-HL":
+        bias = "LONG"
+        bias_conf += 0.15
+        bias_reason.append("HTF bullish structure")
 
-    # =======================
-    # SETUP (CONTEXT FIRST)
-    # =======================
-    if structure == "BULLISH":
-        state = "SETUP_LONG"
-        direction = "LONG"
-        confidence += 0.55
-        if liquidity == "LOW_SWEEP":
-            confidence += 0.15
-        if htf_bias == "BULLISH":
-            confidence += 0.1
+    if htf_structure == "LH-LL":
+        bias = "SHORT"
+        bias_conf += 0.15
+        bias_reason.append("HTF bearish structure")
 
-    elif structure == "BEARISH":
-        state = "SETUP_SHORT"
-        direction = "SHORT"
-        confidence += 0.55
-        if liquidity == "HIGH_SWEEP":
-            confidence += 0.15
-        if htf_bias == "BEARISH":
-            confidence += 0.1
+    if liquidity == "SELL_SIDE_TAKEN" and bias == "LONG":
+        bias_conf += 0.1
+        bias_reason.append("Sell-side liquidity swept")
 
-    # =======================
-    # EXECUTION (TRIGGER ONLY)
-    # =======================
-    displacement = abs(last.close - last.open) > current_atr
+    if liquidity == "BUY_SIDE_TAKEN" and bias == "SHORT":
+        bias_conf += 0.1
+        bias_reason.append("Buy-side liquidity swept")
 
-    if state == "SETUP_LONG":
-        bos = last.close > df_1h["high"].iloc[-6:-1].max()
-        if bos and displacement:
-            state = "EXECUTE_LONG"
-            confidence += 0.2
+    plays = []
 
-    if state == "SETUP_SHORT":
-        bos = last.close < df_1h["low"].iloc[-6:-1].min()
-        if bos and displacement:
-            state = "EXECUTE_SHORT"
-            confidence += 0.2
+    if bias == "LONG" and price_location == "DISCOUNT":
+        plays.append({
+            "play_type": "CONTINUATION",
+            "direction": "LONG",
+            "setup_condition": "Pullback into discount with bullish HTF bias",
+            "invalidation": "Break below last higher low",
+            "execution_ready": False,
+            "probability": round(bias_conf, 2)
+        })
+
+    if bias == "SHORT" and price_location == "PREMIUM":
+        plays.append({
+            "play_type": "CONTINUATION",
+            "direction": "SHORT",
+            "setup_condition": "Pullback into premium with bearish HTF bias",
+            "invalidation": "Break above last lower high",
+            "execution_ready": False,
+            "probability": round(bias_conf, 2)
+        })
 
     return {
         "symbol": req.symbol,
         "timeframe": req.timeframe,
-        "state": state,
-        "direction": direction,
-        "confidence": round(min(confidence, 1.0), 2),
-        "structure": structure,
-        "liquidity_event": liquidity,
-        "htf_bias": htf_bias,
-        "execution_validity": "next_candle" if "EXECUTE" in state else None,
-        "engine_type": "SMC_STATE_ENGINE"
+        "market_state": {
+            "trend": bias,
+            "structure": ltf_structure,
+            "liquidity_state": liquidity
+        },
+        "price_location": {
+            "relative_position": price_location
+        },
+        "bias": {
+            "direction": bias,
+            "confidence": round(min(bias_conf, 1.0), 2),
+            "reason": bias_reason
+        },
+        "plays": plays,
+        "execution": {
+            "allowed": False,
+            "reason": "Awaiting confirmation"
+        },
+        "data_quality": {
+            "candles_used": len(df),
+            "confidence": "HIGH"
+        }
     }
