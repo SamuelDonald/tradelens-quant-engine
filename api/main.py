@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Dict, Optional
 
 from fastapi import FastAPI, HTTPException
@@ -16,7 +17,10 @@ from engine.decision.trade_decision_engine import TradeDecisionEngine
 from engine.data.feeds.feed_router import FeedRouter
 from engine.data.feeds.historical_loader import HistoricalLoader
 from engine.data.feeds.scheduler import MarketDataScheduler
+from engine.data.store.sqlite_store import SQLiteCandleStore
 from config.symbols import SYMBOLS, TIMEFRAMES, ASSET_TYPES
+from config.symbols import PROVIDER_SYMBOLS
+from engine.observability import ENGINE_STATS
 
 
 app = FastAPI(title="TradeLens Quant Engine", version="0.1.0")
@@ -35,6 +39,7 @@ decision_engine = TradeDecisionEngine(min_aligned_models=3)
 
 router: Optional[FeedRouter] = None
 scheduler: Optional[MarketDataScheduler] = None
+store: Optional[SQLiteCandleStore] = None
 
 def _run_models(symbol: str, timeframe: str) -> Dict:
     if timeframe not in data_managers:
@@ -62,10 +67,27 @@ def _run_models(symbol: str, timeframe: str) -> Dict:
 @app.get("/health")
 def get_health() -> Dict:
     symbols = sorted({s for dm in data_managers.values() for s in dm._candles.keys()})
+    now = int(time.time())
     return {
         "status": "ok",
         "tracked_symbols": symbols,
         "timeframes": list(data_managers.keys()),
+        "provider_stats": {
+            name: {
+                "requests": ps.requests,
+                "successes": ps.successes,
+                "failures": ps.failures,
+                "fallbacks": ps.fallbacks,
+                "last_error": ps.last_error,
+                "last_error_ts": ps.last_error_ts,
+                "last_latency_ms": ps.last_latency_ms,
+            }
+            for name, ps in ENGINE_STATS.providers.items()
+        },
+        "data_freshness_seconds": {
+            tf: {sym: (now - ts) for sym, ts in sym_map.items()}
+            for tf, sym_map in ENGINE_STATS.last_update_ts.items()
+        },
     }
 
 
@@ -103,12 +125,19 @@ def get_signal(symbol: str, timeframe: str = "1m") -> Dict:
 
 @app.on_event("startup")
 async def _startup() -> None:
-    global router, scheduler
+    global router, scheduler, store
 
-    router = FeedRouter(symbol_asset_overrides=ASSET_TYPES)
-    loader = HistoricalLoader(router=router)
+    store = SQLiteCandleStore()
+    router = FeedRouter(symbol_asset_overrides=ASSET_TYPES, provider_symbols=PROVIDER_SYMBOLS)
+    loader = HistoricalLoader(router=router, store=store)
     await loader.load(data_managers=data_managers, symbols=SYMBOLS, timeframes=TIMEFRAMES, min_candles=200)
 
-    scheduler = MarketDataScheduler(router=router, data_managers=data_managers, symbols=SYMBOLS, timeframes=TIMEFRAMES)
+    scheduler = MarketDataScheduler(
+        router=router,
+        data_managers=data_managers,
+        symbols=SYMBOLS,
+        timeframes=TIMEFRAMES,
+        store=store,
+    )
     asyncio.create_task(scheduler.run())
 

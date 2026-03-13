@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from engine.data.data_manager import DataManager
 from engine.data.feeds.base_feed import validate_candle_dict
 from engine.data.feeds.feed_router import FeedRouter
+from engine.data.store.sqlite_store import SQLiteCandleStore
+from engine.observability import ENGINE_STATS
 
 
 class MarketDataScheduler:
@@ -23,12 +25,14 @@ class MarketDataScheduler:
         symbols: List[str],
         timeframes: List[str],
         poll_seconds: int = 60,
+        store: Optional[SQLiteCandleStore] = None,
     ):
         self.router = router
         self.data_managers = data_managers
         self.symbols = symbols
         self.timeframes = timeframes
         self.poll_seconds = poll_seconds
+        self.store = store
         self._running = False
 
     def _should_append(self, dm: DataManager, symbol: str, candle: Dict) -> bool:
@@ -52,6 +56,9 @@ class MarketDataScheduler:
                         continue
                     if self._should_append(dm, symbol, candle):
                         dm.update_market_data(symbol, candle)
+                        if self.store:
+                            self.store.put_one(symbol, timeframe, candle)
+                        ENGINE_STATS.record_last_update(timeframe, symbol, int(candle["timestamp"]))
 
             elapsed = time.time() - start
             sleep_for = max(0.0, self.poll_seconds - elapsed)
